@@ -1,0 +1,36 @@
+# Build and local IDE state
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.dSYM/
+*.mobileprovision
+*.p12
+*.p8
+
+# Credentials, diagnostics and personal listening data
+.env
+.env.*
+!.env.example
+diagnostics/
+private/
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+device-smoke*.json
+local-recommendation.json
+adaptive-decisions*.json
+active-playback.json
+song-content-profiles*.json
+netease-history.json
+secrets.*
+
+# Local tools
+.build/
+node_modules/
+__pycache__/
+.venv/
