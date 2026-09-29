@@ -82,6 +82,9 @@ final class BGMViewModel: ObservableObject {
     private var moodObservedAt: Date?
     private var restoringReportedContext = false
     private var confirmedIntentAt: Date?
+    private var visualPlaceCategory: String?
+    private var visualPlaceObservedAt: Date?
+    private var pendingRetryDecisionID: String?
     private var analysisTask: Task<CloudSceneAnalysis, Error>?
     private var analysisGeneration = 0
     private var artworkTask: Task<Void, Never>?
@@ -116,6 +119,13 @@ final class BGMViewModel: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var failureObserver: NSObjectProtocol?
     private var systemObservers: [NSObjectProtocol] = []
+    private var isDeviceCheck: Bool {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["LINTING_DEVICE_CHECK"] == "1"
+        #else
+        return false
+        #endif
+    }
     private var statusObservation: NSKeyValueObservation?
     private var transportObservation: NSKeyValueObservation?
 
@@ -227,6 +237,7 @@ final class BGMViewModel: ObservableObject {
     }
 
     private func startManual(_ track: RecommendedTrack, parent: DecisionResponse?, reason: String, source: String) async {
+        pendingRetryDecisionID = nil
         generation += 1
         let token = generation
         isLoading = true
@@ -251,6 +262,7 @@ final class BGMViewModel: ObservableObject {
         recommendations = response.items
         if !(await startTrack(track, from: response, decisionID: manualID, startReason: reason,
                               expectedGeneration: token, source: source)) {
+            pendingRetryDecisionID = manualID
             await decideAndStart(expectedGeneration: token)
         }
     }
@@ -276,7 +288,7 @@ final class BGMViewModel: ObservableObject {
     func feedback(_ event: String) {
         guard let track = currentTrack, let tracker, !isLoading else { return }
         let kind = event == "liked" && isLiked ? "unliked" : event
-        guard ["liked", "unliked", "disliked", "unsuitable"].contains(kind) else { return }
+        guard ["liked", "unliked", "disliked", "suitable", "unsuitable"].contains(kind) else { return }
         recordAction(kind, source: "app")
         do {
             try recommender.recordFeedback(trackID: track.id, decisionID: currentRecommendationID,
@@ -285,6 +297,9 @@ final class BGMViewModel: ObservableObject {
             if kind == "liked" || kind == "unliked" {
                 isLiked = kind == "liked"
                 message = isLiked ? "已喜欢，将用于学习你的口味与当下偏好。" : "已取消本机喜欢。"
+                schedulePreparation()
+            } else if kind == "suitable" {
+                message = "已记录这首此刻合适；它与长期喜欢分开学习。"
                 schedulePreparation()
             } else {
                 Task { await transition(endingReason: kind == "disliked" ? "explicit_dislike" : "context_unsuitable", source: "app") }
@@ -304,6 +319,7 @@ final class BGMViewModel: ObservableObject {
         locationContext.refreshIfAuthorized()
         let locationLabel = locationContext.freshCategory == nil ? nil : locationContext.semanticLabel
         let locationObservedAt = locationLabel == nil ? nil : locationContext.observedAt
+        let locationCategory = locationLabel == nil ? nil : locationContext.freshCategory
         let task = Task {
             try await CloudVisualAnalyzer.analyze(jpegData, userNote: note, mood: mood, policy: policy,
                 capturedAt: capturedAt, captureTimeLabel: captureTimeLabel,
@@ -314,6 +330,8 @@ final class BGMViewModel: ObservableObject {
             let result = try await task.value
             guard token == analysisGeneration, !Task.isCancelled else { return }
             lastSceneAnalysis = result
+            visualPlaceCategory = result.locationLabel == nil ? nil : locationCategory
+            visualPlaceObservedAt = result.locationObservedAt
             scene = result.sceneResponse
             sceneCapturedAt = capturedAt ?? result.analyzedAt
             sceneConfidence = result.confidence
@@ -336,15 +354,24 @@ final class BGMViewModel: ObservableObject {
     }
 
     var inferredListeningIntent: ListeningIntentHypothesis? {
-        lastSceneAnalysis?.intentHypotheses?.filter { $0.intent != .unknown }
-            .max { $0.confidence < $1.confidence }
+        let usable = lastSceneAnalysis?.intentHypotheses?.filter { $0.intent != .unknown && $0.confidence >= 0.35 } ?? []
+        let reported = usable.filter { $0.source == .userReport }
+        return (reported.isEmpty ? usable : reported).max { $0.confidence < $1.confidence }
     }
 
-    var inferredIntentConfirmed: Bool { confirmedListeningIntent != nil }
+    var inferredIntentConfirmed: Bool {
+        confirmedListeningIntent != nil && listeningContext.visualQuality(at: Date()) > 0
+    }
 
     var intentConfirmationText: String {
-        if let confirmedListeningIntent { return "已按你的选择：" + confirmedListeningIntent.title }
+        if modeSelection != .auto { return "当前采用你手动选择的听歌方向，图片意图暂不参与。" }
+        if let confirmedListeningIntent {
+            return listeningContext.visualQuality(at: Date()) > 0 ? "已按你的选择：" + confirmedListeningIntent.title : "此前确认的意图已过期，可重新选择当前方向。"
+        }
         guard let hypothesis = inferredListeningIntent else { return "尚无明确意图；仍按听歌反馈推荐。" }
+        guard listeningContext.visualQuality(at: Date()) > 0 else {
+            return "图片意图已过期、场景已变或已有你的自述，当前不再沿用旧推断。"
+        }
         if inferredIntentPolicy == .confirmOnly { return "待你确认：" + hypothesis.intent.title }
         return "轻量参考：" + hypothesis.intent.title + "，可随时纠正。"
     }
@@ -430,6 +457,7 @@ final class BGMViewModel: ObservableObject {
     private func clearCurrentSceneContext() {
         lastSceneAnalysis = nil; scene = nil; sceneCapturedAt = nil; sceneConfidence = 0
         confirmedListeningIntent = nil; confirmedIntentAt = nil
+        visualPlaceCategory = nil; visualPlaceObservedAt = nil
     }
 
     func verifyNetEaseDirect() async { await play() }
@@ -464,6 +492,7 @@ final class BGMViewModel: ObservableObject {
             if token == generation { isLoading = false }
             lease.end()
         }
+        pendingRetryDecisionID = endingReason == "playback_error" ? currentRecommendationID : nil
         if let endingReason { finishCurrent(reason: endingReason) }
         if endingReason == "natural_end" { consecutiveFailures = 0 }
         decision = nil; recommendations = []; modeUsed = nil; contextScene = nil
@@ -481,13 +510,18 @@ final class BGMViewModel: ObservableObject {
                 let result = try await recommender.nextDecision(selection: modeSelection,
                     discovery: discovery, scene: freshScene, health: effectiveHealth,
                     history: musicAccount.listeningRows, excludeIDs: excludedRecommendationIDs,
-                    sceneObservedAt: freshScene == nil ? nil : sceneCapturedAt, listeningContext: listeningContext)
+                    sceneObservedAt: freshScene == nil ? nil : sceneCapturedAt, listeningContext: listeningContext,
+                    parentDecisionID: pendingRetryDecisionID)
                 guard token == generation else { return }
+                pendingRetryDecisionID = result.recommendationID
                 decision = result; recommendations = result.items; strategyVersion = result.strategyVersion
                 modeUsed = nil; modeSource = result.modeSource; modeExplanation = result.modeExplanation
                 contextScene = result.contextUsed?.scene; learningSummary = recommender.learningSummary
                 if await startTrack(result.track, from: result, decisionID: result.recommendationID,
-                                    startReason: "automatic", expectedGeneration: token) { return }
+                                    startReason: "automatic", expectedGeneration: token) {
+                    pendingRetryDecisionID = nil
+                    return
+                }
             } catch {
                 guard token == generation, !Task.isCancelled else { return }
                 message = "手机选曲失败：\(error.localizedDescription)"
@@ -501,6 +535,7 @@ final class BGMViewModel: ObservableObject {
                             decisionID: String?, startReason: String, expectedGeneration: Int? = nil,
                             source: String = "app") async -> Bool {
         let token = expectedGeneration ?? generation
+        let evidenceStartReason = isDeviceCheck ? "diagnostic" : startReason
         do {
             let cached = playbackURLs[track.id].map { Date().timeIntervalSince($0.at) < 240 } == true
             let url = try await playbackURL(for: track.id)
@@ -526,7 +561,7 @@ final class BGMViewModel: ObservableObject {
             isLiked = recommender.isLiked(trackID: track.id,
                 imported: musicAccount.listeningRows.contains { $0.id == track.id && $0.liked })
             tracker = PlaybackTracker(decisionID: decisionID, trackID: track.id,
-                                      startReason: startReason, duration: track.durationSeconds)
+                                      startReason: evidenceStartReason, duration: track.durationSeconds)
             tracker?.resetPosition(0, monotonic: ProcessInfo.processInfo.systemUptime, isPlaying: false)
             observe(item)
             recordAction("play", source: startReason == "automatic" ? "automatic" : startReason == "diagnostic" ? "system" : "app")
@@ -551,7 +586,7 @@ final class BGMViewModel: ObservableObject {
             rememberFailed(track.id)
             let failure = PlaybackEvidence(id: UUID().uuidString, decisionID: decisionID, trackID: track.id,
                 startedAt: Date(), endedAt: Date(), duration: track.durationSeconds, renderedSeconds: 0,
-                uniqueCoveredSeconds: 0, lastPosition: 0, startReason: startReason,
+                uniqueCoveredSeconds: 0, lastPosition: 0, startReason: evidenceStartReason,
                 endReason: "playback_error", actions: [], contentKind: "unknown")
             try? recommender.recordEpisode(failure)
             message = "“\(track.title)”暂时无法播放，正在重新选曲。"
@@ -604,7 +639,8 @@ final class BGMViewModel: ObservableObject {
     }
 
     private var freshScene: SceneResponse? {
-        sceneConfidence >= 0.35 && sceneCapturedAt.map { Date().timeIntervalSince($0) < 24 * 3600 } == true ? scene : nil
+        guard sceneConfidence >= 0.35, let capturedAt = sceneCapturedAt else { return nil }
+        return listeningContext.sceneQuality(confidence: sceneConfidence, observedAt: capturedAt, at: Date()) > 0 ? scene : nil
     }
 
     private var listeningContext: RecommendationListeningContext {
@@ -616,7 +652,12 @@ final class BGMViewModel: ObservableObject {
             confidence: confirmed ? 1 : (hypothesis?.confidence ?? 0), confirmed: confirmed,
             observedAt: confirmed ? confirmedIntentAt : inferredAt,
             selfReportedMood: selfReportedMood, moodObservedAt: moodObservedAt,
-            placeCategory: locationContext.freshCategory, placeObservedAt: locationContext.observedAt)
+            placeCategory: locationContext.freshCategory, placeObservedAt: locationContext.observedAt,
+            placeConfidence: locationContext.semanticConfidence,
+            visualSource: hypothesis?.source,
+            visualPlaceCategory: visualPlaceCategory, visualPlaceObservedAt: visualPlaceObservedAt,
+            visualIncludesPlaceEvidence: lastSceneAnalysis?.locationLabel != nil,
+            contextChangedAt: locationContext.semanticChangedAt)
     }
 
     private var effectiveHealth: HealthContext? { health.enabled ? cachedHealth : nil }
@@ -773,7 +814,8 @@ final class BGMViewModel: ObservableObject {
 
     private func recordAction(_ kind: String, source: String, target: Double? = nil) {
         guard let current = tracker else { return }
-        let action = PlaybackAction(kind: kind, at: Date(), position: safePosition, targetPosition: target, source: source)
+        let action = PlaybackAction(kind: kind, at: Date(), position: safePosition, targetPosition: target,
+                                    source: isDeviceCheck ? "diagnostic" : source)
         tracker?.append(action)
         do {
             try recommender.recordAction(action, trackID: current.trackID,

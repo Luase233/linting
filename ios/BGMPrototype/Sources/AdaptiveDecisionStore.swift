@@ -9,6 +9,33 @@ struct AdaptiveCandidateSnapshot: Codable {
     let probability: Double?
     var scoreFactors: [String: Double]? = nil
     var predictionUpdates: [String: Int]? = nil
+    var title: String? = nil
+    var artist: String? = nil
+    var recallChannels: [String]? = nil
+    var effectiveEvidence: [String: Int]? = nil
+    var eligibleForExploration: Bool? = nil
+    var modelVersion: String? = nil
+    var contextAblationScore: Double? = nil
+    var selectionRole: String? = nil
+    var mainProbability: Double? = nil
+    var explorationProbability: Double? = nil
+    var labelVersion: String? = nil
+    var calibrationStatus: String? = nil
+}
+
+struct ContextCandidateEffect: Codable {
+    let trackID: String
+    let scoreDelta: Double
+    let rankDelta: Int
+}
+
+struct ContextInfluenceSnapshot: Codable {
+    let source: String
+    let coverage: Double
+    let missing: [String]
+    let candidateEffects: [ContextCandidateEffect]
+    let totalVariation: Double
+    let rankingChanged: Bool
 }
 
 struct AdaptiveDecisionSnapshot: Codable {
@@ -22,6 +49,8 @@ struct AdaptiveDecisionSnapshot: Codable {
     var parentDecisionID: String? = nil
     var samplingTemperature: Double? = nil
     var uniformExploration: Double? = nil
+    var explorationBudget: Double? = nil
+    var contextInfluences: [ContextInfluenceSnapshot]? = nil
 
     func candidate(_ id: String) -> AdaptiveCandidateSnapshot? { candidates.first { $0.trackID == id } }
 }
@@ -33,6 +62,7 @@ struct AdaptiveJournalEvent: Codable {
     let decisionID: String?
     let kind: String
     let action: PlaybackAction?
+    var labelVersion: String? = nil
 }
 
 struct AdaptiveLearningState: Codable {
@@ -54,6 +84,18 @@ struct AdaptiveLearningState: Codable {
     var trackStarts: [String: Int] = [:]
     var trackLastStarted: [String: Date] = [:]
     var recentSourceTags: [String] = []
+    // Optional for decoding old archives. Counts are actual qualified observations of THIS track
+    // under the versioned targets, never global optimizer steps masquerading as song evidence.
+    var targetEvidenceCounts: [String: [String: Int]]? = nil
+    var targetLabelVersion: String? = nil
+
+    func effectiveEvidence(trackID: String) -> [String: Int] { targetEvidenceCounts?[trackID] ?? [:] }
+
+    mutating func countEvidence(trackID: String, head: String) {
+        if targetEvidenceCounts == nil { targetEvidenceCounts = [:] }
+        targetEvidenceCounts?[trackID, default: [:]][head, default: 0] += 1
+        targetLabelVersion = AdaptivePreferenceModel.targetVersion
+    }
 
     mutating func trim() {
         decisions = Array(decisions.suffix(32))
@@ -123,39 +165,42 @@ final class AdaptiveDecisionStore {
         let snapshot = self.snapshot(decisionID: evidence.decisionID, trackID: evidence.trackID)
         try transaction { next in
             next.processedEpisodes.append(evidence.id)
-            next.episodes.append(evidence)
-            next.episodeCount += 1
             let targets = AdaptiveEpisodeTargets.from(evidence, recentSkipRun: next.recentSkipRun)
+            var annotated = evidence
+            annotated.labelVersion = targets.labelVersion
+            annotated.continuationTarget = targets.continuation
+            annotated.continuationCensorReason = targets.censorReason
+            next.episodes.append(annotated)
+            // Keep diagnostics auditable without changing the user's behavioral state.
+            guard !evidence.isDiagnostic else { return }
+            next.episodeCount += 1
             let trained = Set(next.trainedHeads[evidence.id] ?? [])
             var added: [String] = []
-            if let snapshot, targets.confidence > 0 {
-                if let target = targets.acceptance, !trained.contains("acceptance") {
-                    next.model.acceptance.update(features: snapshot.features, target: target, confidence: targets.confidence(for: "acceptance"))
-                    added.append("acceptance")
+            if let snapshot {
+                if let target = targets.continuation, !trained.contains("v2:continuation") {
+                    next.model.continuation.update(features: snapshot.features, target: target, confidence: targets.confidence(for: "continuation"))
+                    next.countEvidence(trackID: evidence.trackID, head: "continuation")
+                    added.append("v2:continuation")
                 }
-                if let target = targets.rejection, !trained.contains("rejection") {
-                    next.model.rejection.updateContextually(features: snapshot.features,
-                        target: target, confidence: targets.confidence(for: "rejection"))
-                    added.append("rejection")
-                }
-                if let target = targets.replay, !trained.contains("replay") {
+                if let target = targets.replay, !trained.contains("v2:replay") {
                     next.model.replay.update(features: snapshot.features, target: target, confidence: targets.confidence(for: "replay"))
-                    added.append("replay")
+                    next.countEvidence(trackID: evidence.trackID, head: "replay")
+                    added.append("v2:replay")
                 }
                 if !added.isEmpty { next.learnedEpisodes += 1 }
             }
             next.trainedHeads[evidence.id] = Array(trained.union(added))
             if targets.skipStrength > 0.1 { next.recentSkipRun += 1 }
-            else if evidence.renderedSeconds > 45 { next.recentSkipRun = 0 }
-            if let duration = evidence.duration, duration > 0, evidence.renderedSeconds > 0 {
+            else if targets.continuation == 1 { next.recentSkipRun = 0 }
+            if targets.continuation != nil, let duration = evidence.duration, duration > 0, evidence.renderedSeconds > 0 {
                 next.recentCoverage.append(min(1, evidence.uniqueCoveredSeconds / duration))
             }
         }
     }
 
     func recordFeedback(trackID: String, decisionID: String?, episodeID: String, kind: String) throws {
-        guard ["liked", "unliked", "disliked", "unsuitable"].contains(kind) else { return }
-        let channel = kind == "unsuitable" ? "context" : "preference"
+        guard ["liked", "unliked", "disliked", "suitable", "unsuitable"].contains(kind) else { return }
+        let channel = ["suitable", "unsuitable"].contains(kind) ? "context" : "preference"
         let key = episodeID + "|" + channel
         guard state.feedbackState[key] != kind else { return }
         let snapshot = self.snapshot(decisionID: decisionID, trackID: trackID)
@@ -163,20 +208,24 @@ final class AdaptiveDecisionStore {
             next.feedbackState[key] = kind
             next.explicitFeedbackCount += 1
             next.journal.append(AdaptiveJournalEvent(at: Date(), episodeID: episodeID, trackID: trackID,
-                decisionID: decisionID, kind: kind, action: nil))
+                decisionID: decisionID, kind: kind, action: nil, labelVersion: AdaptivePreferenceModel.targetVersion))
             guard let snapshot else { return }
             var trained = Set(next.trainedHeads[episodeID] ?? [])
             if kind == "liked" || kind == "unliked" || kind == "disliked" {
                 next.model.affinity.update(features: snapshot.features,
                     target: kind == "liked" ? 1 : (kind == "unliked" ? 0.5 : 0), confidence: kind == "unliked" ? 0.5 : 1)
-                trained.insert("affinity")
+                if !trained.contains("v2:affinity") { next.countEvidence(trackID: trackID, head: "affinity") }
+                trained.insert("v2:affinity")
             }
-            if kind == "unsuitable" || kind == "disliked" {
-                if kind == "unsuitable" {
-                    next.model.rejection.updateContextually(features: snapshot.features, target: 1, confidence: 1)
-                } else { next.model.rejection.update(features: snapshot.features, target: 1, confidence: 1) }
-                next.model.acceptance.updateContextually(features: snapshot.features, target: 0, confidence: 0.8)
-                trained.formUnion(["rejection", "acceptance"])
+            if kind == "suitable" || kind == "unsuitable" {
+                // Old decisions do not contain bounded item-context interactions. They remain
+                // auditable but cannot train a new fit target with an invented feature vector.
+                let fitFeatures = AdaptivePreferenceModel.fitFeatures(snapshot.features)
+                if !fitFeatures.isEmpty {
+                    next.model.fit.update(features: fitFeatures, target: kind == "suitable" ? 1 : 0, confidence: 1)
+                    if !trained.contains("v2:fit") { next.countEvidence(trackID: trackID, head: "fit") }
+                    trained.insert("v2:fit")
+                }
             }
             next.trainedHeads[episodeID] = Array(trained)
         }
@@ -185,9 +234,11 @@ final class AdaptiveDecisionStore {
     func recordAction(_ action: PlaybackAction, trackID: String, decisionID: String?, episodeID: String) throws {
         guard !state.journal.contains(where: { $0.action?.id == action.id }) else { return }
         let snapshot = self.snapshot(decisionID: decisionID, trackID: trackID)
+        let diagnosticDecision = state.decisions.last(where: { $0.id == decisionID })?.selection == "diagnostic"
         try transaction { next in
             next.journal.append(AdaptiveJournalEvent(at: action.at, episodeID: episodeID, trackID: trackID,
                 decisionID: decisionID, kind: action.kind, action: action))
+            guard action.source != "diagnostic", !diagnosticDecision else { return }
             if action.kind == "started", !next.startedEpisodes.contains(episodeID) {
                 next.startedEpisodes.append(episodeID)
                 next.trackStarts[trackID, default: 0] += 1

@@ -17,6 +17,12 @@ run_check() {
 
 run_check PlaybackEvidenceChecks "$sources/PlaybackEvidence.swift"
 run_check ScoreSemanticsChecks "$sources/PlaybackEvidence.swift" "$sources/AdaptivePreferenceModel.swift"
+run_check AdaptivePreferenceModelChecks "$sources/PlaybackEvidence.swift" "$sources/AdaptivePreferenceModel.swift" "$sources/AdaptiveDecisionStore.swift" "$sources/ListeningDatabase.swift"
 run_check TempoEstimatorChecks "$sources/TempoEstimator.swift" "$sources/PlaybackEvidence.swift" "$sources/AdaptivePreferenceModel.swift"
 run_check SongAnalysisBudgetChecks "$sources/SongAnalysisBudget.swift"
 run_check PhotoTimestampChecks "$sources/PhotoTimestamp.swift"
+run_check ListeningIntentContextChecks "$sources/Models.swift" "$sources/HealthFeatures.swift" "$sources/ListeningIntentContext.swift"
+sed '/^@MainActor/,$d' "$sources/LocationContextManager.swift" > "$check_dir/PlaceModels.swift"
+run_check PlaceContextChecks "$check_dir/PlaceModels.swift" "$sources/MapCoordinateAdapter.swift"
+run_check RecommendationPreparationChecks "$sources/Models.swift" "$sources/HealthFeatures.swift" "$sources/ListeningIntentContext.swift" "$sources/PlaybackEvidence.swift" "$sources/AdaptivePreferenceModel.swift" "$sources/AdaptiveDecisionStore.swift" "$sources/ListeningDatabase.swift" "$sources/LocalRecommendationEngine.swift"
+python3 "$checks/EvaluationChecks.py"

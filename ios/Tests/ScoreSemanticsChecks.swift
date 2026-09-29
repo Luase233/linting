@@ -35,8 +35,8 @@ import Foundation
         let scores = [-2.0, 0.1, 1.2, 0.5]
         let probabilities = AdaptivePreferenceModel.softmax(scores)
         let shifted = AdaptivePreferenceModel.softmax(scores.map { $0 + 100 })
-        require(abs(probabilities.reduce(0, +) - 1) < 1e-12 && probabilities.allSatisfy { $0 >= 0.08 / 4 },
-            "exploration distribution must sum to one and include every candidate")
+        require(abs(probabilities.reduce(0, +) - 1) < 1e-12 && probabilities.allSatisfy { $0 >= 0 },
+            "softmax helper must normalize without uniform exploration by default")
         require(zip(probabilities, shifted).allSatisfy { abs($0 - $1) < 1e-12 }, "baseline offsets cannot change sampling probability")
         var observed = [Int](repeating: 0, count: 4)
         for i in 0..<10_000 {
@@ -74,13 +74,13 @@ import Foundation
                 endReason: end, actions: actions, contentKind: kind)
         }
         let completed = AdaptiveEpisodeTargets.from(evidence("manual_search", "natural_end", "full", 200))
-        require(completed.acceptance == 0.8 && completed.rejection == 0.2 && completed.confidence == 0.2,
-            "verified manual completion supplies weak continuation and low-rejection evidence")
+        require(completed.continuation == 1 && completed.acceptance == nil && completed.rejection == nil && completed.confidence == 1,
+            "manual completion supplies observed continuation independently of old soft targets")
         require(AdaptiveEpisodeTargets.from(evidence("manual_search", "natural_end", "preview", 30)).acceptance == nil,
             "preview ending cannot earn full-song completion evidence")
         let automatic = AdaptiveEpisodeTargets.from(evidence("automatic", "natural_end", "full", 200))
-        require(automatic.acceptance == nil && automatic.rejection == nil,
-            "unattended automatic completion remains an observation, not an inferred preference")
+        require(automatic.continuation == 1 && automatic.acceptance == nil && automatic.rejection == nil,
+            "automatic playback supplies observed continuation without inferring liking or fit")
         require(AdaptiveEpisodeTargets.from(evidence("manual_replay", "user_next", "full", 2)).replay == nil,
             "a replay click without real repeat listening cannot earn replay reward")
         let repeatedThenSkipped = AdaptiveEpisodeTargets.from(evidence("manual_replay", "user_next", "full", 15))
@@ -90,6 +90,54 @@ import Foundation
             "stronger skip evidence must not inflate a weak replay reward")
         require(AdaptiveEpisodeTargets.from(evidence("automatic", "user_next", "full", 15, source: "system")).confidence == 0,
             "diagnostic/system switching must not teach dislike")
+
+        for start in ["diagnostic", "system", "device_smoke"] {
+            let diagnostic = AdaptiveEpisodeTargets.from(evidence(start, "natural_end", "full", 200))
+            require(diagnostic.continuation == nil && diagnostic.replay == nil && diagnostic.confidence == 0,
+                "diagnostic natural completion cannot teach a preference or continuation target")
+        }
+        for kind in ["preview", "unknown"] {
+            let censored = AdaptiveEpisodeTargets.from(evidence("automatic", "natural_end", kind, 200))
+            require(censored.continuation == nil && censored.confidence == 0 && censored.censorReason != nil,
+                "incomplete/unknown renditions remain censored even after long playback")
+        }
+        require(AdaptiveEpisodeTargets.from(evidence("automatic", "playback_error", "full", 120)).continuation == nil,
+            "a failure cannot receive a positive or negative preference target")
+        require(AdaptiveEpisodeTargets.from(evidence("automatic", "user_next", "full", 59.9)).continuation == 0,
+            "below the fixed observation window an explicit skip is negative")
+        require(AdaptiveEpisodeTargets.from(evidence("automatic", "user_next", "full", 60)).continuation == 1,
+            "the exact completed window is positive")
+        require(AdaptiveEpisodeTargets.from(evidence("automatic", "unknown", "full", 120)).continuation == nil,
+            "unknown recovery endpoints are censored")
+        let itemA = AdaptivePreferenceModel.features(context: ["place.home": 1], music: [:], trackID: "song-a", artist: "A", sourceTag: "same", known: false)
+        let itemB = AdaptivePreferenceModel.features(context: ["place.home": 1], music: [:], trackID: "song-b", artist: "A", sourceTag: "same", known: false)
+        var fitModel = AdaptivePreferenceModel()
+        fitModel.fit.update(features: AdaptivePreferenceModel.fitFeatures(itemA), target: 0, confidence: 1)
+        require(fitModel.fit.probability(AdaptivePreferenceModel.fitFeatures(itemA)) < 0.5 && fitModel.fit.probability(AdaptivePreferenceModel.fitFeatures(itemB)) == 0.5,
+            "one unsuitable track cannot lower every song from its source or artist")
+        require(fitModel.fit.weights.keys.allSatisfy { $0.hasPrefix("item_context.") }, "fit gradients must be item-context only")
+        let newNeutral = ["continuation": 0.5, "fit": 0.5, "affinity": 0.5, "replay": 0.5]
+        require(RecommendationScoreDefinition.modelContributions(newNeutral).values.reduce(0, +) == 0, "new untrained heads are neutral")
+        require(RecommendationScoreDefinition.modelContributions(newNeutral)["acceptance"] == nil, "new scores cannot reuse old target semantics")
+
+        let policyCandidates = (0..<200).map { index in
+            RecommendationExplorationPolicy.Candidate(score: index < 6 ? 1 - Double(index) * 0.1 : -10, evidenceCount: 0, interestRelated: index != 4)
+        }
+        let policy = RecommendationExplorationPolicy.distribution(candidates: policyCandidates, discovery: 1, recentSkipRun: 0)
+        require(abs(policy.probabilities.reduce(0, +) - 1) < 1e-12 && policy.explorationBudget == 0.1, "bounded distribution must normalize")
+        require(policy.probabilities.dropFirst(6).allSatisfy { $0 == 0 } && policy.probabilities[4] == 0,
+            "hundreds of low-quality or unrelated tracks cannot gain aggregate exploration mass")
+        require(zip(policy.mainProbabilities, policy.explorationProbabilities).allSatisfy { $0 == 0 || $1 == 0 }, "pools are disjoint and logged role is unambiguous")
+        require(zip(policy.probabilities, zip(policy.mainProbabilities, policy.explorationProbabilities)).allSatisfy { abs($0 - $1.0 - $1.1) < 1e-12 }, "probability components must reconcile")
+        for skipRun in [1, 2, 3, 8] {
+            let tightened = RecommendationExplorationPolicy.distribution(candidates: policyCandidates, discovery: 1, recentSkipRun: skipRun)
+            require(tightened.explorationBudget < policy.explorationBudget, "early-skip run must tighten exploration")
+            if skipRun >= 3 { require(tightened.explorationBudget == 0, "three consecutive early skips suspend exploration") }
+        }
+        require(RecommendationExplorationPolicy.distribution(candidates: policyCandidates, discovery: 0, recentSkipRun: 0).explorationBudget == 0, "zero discovery means no exploration")
+        var policyObserved = [Int](repeating: 0, count: policyCandidates.count)
+        for index in 0..<10000 { policyObserved[AdaptivePreferenceModel.sampledIndex(probabilities: policy.probabilities, uniform: (Double(index) + 0.5) / 10000)] += 1 }
+        require(zip(policyObserved, policy.probabilities).allSatisfy { abs(Double($0) / 10000 - $1) <= 0.00011 }, "gated sampling must match logged probabilities exactly")
 
         struct LegacyRow: Decodable { let score: Double; let predictions: [String: Double]; let scoreFactors: [String: Double]? }
         if CommandLine.arguments.count > 1 {

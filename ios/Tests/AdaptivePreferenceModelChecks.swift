@@ -26,16 +26,16 @@ enum AdaptivePreferenceModelChecks {
             "logged exploration probabilities must form a full distribution")
 
         func episode(_ id: String, end: String = "user_next", seconds: Double = 12, covered: Double = 12,
-                     kind: String = "unknown", actions: [PlaybackAction] = []) -> PlaybackEvidence {
+                     kind: String = "full", actions: [PlaybackAction] = [], start: String = "automatic") -> PlaybackEvidence {
             PlaybackEvidence(id: id, decisionID: "d1", trackID: "1", startedAt: now, endedAt: now.addingTimeInterval(seconds),
                 duration: 200, renderedSeconds: seconds, uniqueCoveredSeconds: covered, lastPosition: 180,
-                startReason: "automatic", endReason: end, actions: actions, contentKind: kind)
+                startReason: start, endReason: end, actions: actions, contentKind: kind)
         }
         let early = AdaptiveEpisodeTargets.from(episode("early"))
         let late = AdaptiveEpisodeTargets.from(episode("late", seconds: 190, covered: 190))
-        require(early.rejection != nil && early.confidence > 0, "unknown rendition should still learn observed user skip")
-        require(early.skipStrength > late.skipStrength && late.confidence < early.confidence,
-            "late fadeout skip must be weaker than early skip")
+        require(early.continuation == 0 && early.confidence > 0, "full rendition early skip is a failed continuation window")
+        require(early.skipStrength == 1 && late.skipStrength == 0 && late.continuation == 1,
+            "a skip after observing the fixed window must not undo actual continuation")
         require(AdaptiveEpisodeTargets.from(episode("auto", end: "natural_end", seconds: 200, covered: 200)).acceptance == nil,
             "unattended completion must not become a like")
         require(AdaptiveEpisodeTargets.from(episode("error", end: "playback_error")).confidence == 0,
@@ -55,17 +55,17 @@ enum AdaptivePreferenceModelChecks {
         try store.transaction { $0.decisions.append(AdaptiveDecisionSnapshot(id: "d1", at: now, chosenTrackID: "1",
             candidates: [candidate], selection: "softmax", policyVersion: "test", context: [:])) }
         try store.recordEpisode(episode("e1"))
-        let count = store.state.model.rejection.updates
+        let count = store.state.model.continuation.updates
         try store.recordEpisode(episode("e1"))
-        require(store.state.episodeCount == 1 && store.state.model.rejection.updates == count, "episode must train once")
+        require(store.state.episodeCount == 1 && store.state.model.continuation.updates == count, "episode must train once")
         try store.recordFeedback(trackID: "1", decisionID: "d1", episodeID: "e2", kind: "unsuitable")
-        let unsuitableWeights = store.state.model.rejection.weights
+        let unsuitableWeights = store.state.model.fit.weights
         require(unsuitableWeights["item.1"] == nil && unsuitableWeights["artist.a"] == nil,
             "context unsuitable must not globally punish track or artist")
-        let explicitCount = store.state.model.rejection.updates
+        let explicitCount = store.state.model.fit.updates
         try store.recordFeedback(trackID: "1", decisionID: "d1", episodeID: "e2", kind: "unsuitable")
         try store.recordEpisode(episode("e2", end: "context_unsuitable"))
-        require(store.state.model.rejection.updates == explicitCount, "explicit feedback and episode cannot double train")
+        require(store.state.model.fit.updates == explicitCount, "explicit feedback and episode cannot double train")
         let replay = PlaybackAction(kind: "replay", at: now, position: 20, targetPosition: 0, source: "app")
         try store.recordAction(replay, trackID: "1", decisionID: "d1", episodeID: "e3")
         try store.recordAction(replay, trackID: "1", decisionID: "d1", episodeID: "e3")
@@ -77,14 +77,64 @@ enum AdaptivePreferenceModelChecks {
         let duplicateStarted = PlaybackAction(kind: "started", at: now, position: 2, targetPosition: nil, source: "system")
         try store.recordAction(duplicateStarted, trackID: "1", decisionID: "d1", episodeID: "e3")
         require(store.state.trackStarts["1"] == 1, "actual starts must be counted once per episode")
-        let beforeError = store.state.model.rejection.updates
+        let beforeError = store.state.model.continuation.updates
+        let coverageBeforeError = store.state.recentCoverage
         try store.recordEpisode(episode("e4", end: "playback_error"))
-        require(store.state.model.rejection.updates == beforeError, "error episode cannot change preference")
+        require(store.state.model.continuation.updates == beforeError, "error episode cannot change preference")
+        require(store.state.recentCoverage == coverageBeforeError, "censored failures cannot alter session adaptation context")
+        require(store.state.effectiveEvidence(trackID: "1")["continuation"] == 1,
+            "track evidence must count qualified episodes only")
+        require(store.state.effectiveEvidence(trackID: "1")["fit"] == 1 && store.state.effectiveEvidence(trackID: "unseen").isEmpty,
+            "a global update count cannot become evidence for an unseen song")
+        try store.recordFeedback(trackID: "1", decisionID: "d1", episodeID: "e2", kind: "suitable")
+        require(store.state.effectiveEvidence(trackID: "1")["fit"] == 1,
+            "correcting feedback in one episode does not manufacture an additional observation")
+        require(store.state.model.acceptance.updates == 0 && store.state.model.rejection.updates == 0,
+            "v2 observations cannot alter historical soft-label heads")
+        require(store.state.model.affinity.updates == 0, "listening and contextual fit do not mean liking")
         let restored = AdaptiveDecisionStore(fileURL: url)
         require(restored.state.episodeCount == store.state.episodeCount, "counts must survive relaunch")
-        require(restored.state.model.rejection.weights == store.state.model.rejection.weights, "learned weights must survive relaunch")
+        require(restored.state.model.continuation.weights == store.state.model.continuation.weights, "learned weights must survive relaunch")
         try restored.recordEpisode(episode("e1"))
         require(restored.state.episodeCount == store.state.episodeCount, "relaunch must preserve idempotency")
+        let beforeDiagnosticCounts = restored.state.model.updateCounts
+        let beforeDiagnosticCoverage = restored.state.recentCoverage
+        let beforeDiagnosticStarts = restored.state.trackStarts
+        let beforeDiagnosticLast = restored.state.trackLastStarted
+        let beforeDiagnosticSources = restored.state.recentSourceTags
+        let beforeDiagnosticEpisodes = restored.state.episodeCount
+        let beforeDiagnosticSkips = restored.state.recentSkipRun
+        let diagnosticStarted = PlaybackAction(kind: "started", at: now, position: 0, targetPosition: nil, source: "diagnostic")
+        try restored.recordAction(diagnosticStarted, trackID: "1", decisionID: "d1", episodeID: "diagnostic")
+        try restored.recordEpisode(episode("diagnostic", end: "natural_end", seconds: 200, covered: 200, start: "diagnostic"))
+        require(restored.state.model.updateCounts == beforeDiagnosticCounts && restored.state.recentCoverage == beforeDiagnosticCoverage,
+            "diagnostic completion cannot train or alter session coverage")
+        require(restored.state.trackStarts == beforeDiagnosticStarts && restored.state.trackLastStarted == beforeDiagnosticLast && restored.state.recentSourceTags == beforeDiagnosticSources,
+            "diagnostic starts cannot change recency or source adaptation")
+        require(restored.state.episodeCount == beforeDiagnosticEpisodes && restored.state.recentSkipRun == beforeDiagnosticSkips,
+            "diagnostic playback cannot change real session counters")
+        require(restored.state.episodes.last?.id == "diagnostic" && restored.state.journal.last?.action?.id == diagnosticStarted.id,
+            "diagnostic evidence must still be available for audit")
+        // Simulate a v1 archive without the new fields, retain its original model and data.
+        var legacyState = AdaptiveLearningState()
+        legacyState.model.acceptance.weights = ["legacy": 1.23]
+        legacyState.model.acceptance.updates = 99
+        legacyState.episodes = [episode("old-raw")]
+        legacyState.decisions = store.state.decisions
+        var legacyJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacyState)) as! [String: Any]
+        var legacyModel = legacyJSON["model"] as! [String: Any]
+        for key in ["continuation", "fit", "labelVersion"] { legacyModel.removeValue(forKey: key) }
+        legacyJSON["model"] = legacyModel
+        let legacyURL = directory.appendingPathComponent("legacy.json")
+        try JSONSerialization.data(withJSONObject: legacyJSON).write(to: legacyURL)
+        let migrated = AdaptiveDecisionStore(fileURL: legacyURL)
+        require(migrated.isReady && migrated.state.model.acceptance.weights["legacy"] == 1.23,
+            "migration must preserve historical labels and weights")
+        require(migrated.state.model.continuation.updates == 0 && migrated.state.model.fit.updates == 0,
+            "new observed objectives start clean rather than reuse old soft targets")
+        require(migrated.state.episodes.map(\.id) == ["old-raw"] && migrated.state.decisions.count == legacyState.decisions.count,
+            "migration must retain original raw observations and decisions")
+        require(FileManager.default.fileExists(atPath: legacyURL.path), "migration keeps recovery archive")
         print("Adaptive preference checks passed: contextual learning, probabilities, observation quality, idempotency, failure isolation and persistence")
     }
 }

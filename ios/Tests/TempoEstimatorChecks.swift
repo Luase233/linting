@@ -77,7 +77,7 @@ enum TempoEstimatorChecks {
             let evidence = PlaybackEvidence(id: reason, decisionID: nil, trackID: "1", startedAt: now, endedAt: now,
                 duration: 200, renderedSeconds: 200, uniqueCoveredSeconds: 200, lastPosition: 200,
                 startReason: reason, endReason: "natural_end", actions: [], contentKind: "full")
-            require(AdaptiveEpisodeTargets.from(evidence).acceptance != nil,
+            require(AdaptiveEpisodeTargets.from(evidence).continuation == 1,
                 "Intentional search/playlist play must continue learning")
         }
         print("Tempo checks passed: pulse rates, silence, tone, noise, short audio, confidence and manual-choice learning.")

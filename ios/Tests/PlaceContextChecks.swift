@@ -31,6 +31,12 @@ enum PlaceContextChecks {
         let match = PlaceMatcher.match(point(), places: [home, school], previous: nil, now: now)
         precondition(match?.category == "home" && match?.label == "在家", "Home recognition")
         precondition(match?.label.contains(home.name) == false, "User's private place name must not become cloud label")
+        let precise = PlaceMatcher.match(point(accuracy: 10), places: [home], previous: nil, now: now)
+        let coarse = PlaceMatcher.match(point(accuracy: 240), places: [home], previous: nil, now: now)
+        precondition((precise?.confidence ?? 0) > (coarse?.confidence ?? 1), "Fix precision must change semantic confidence")
+        var broadPlace = home; broadPlace.radius = 3000
+        precondition((PlaceMatcher.match(point(accuracy: 240), places: [broadPlace], previous: nil, now: now)?.confidence ?? 1) <= 0.2,
+            "A broad saved radius must not turn coarse GPS into high confidence")
         let schoolMatch = PlaceMatcher.match(point(latitude: school.latitude, longitude: school.longitude), places: [home, school], previous: nil, now: now)
         precondition(schoolMatch?.category == "school" && schoolMatch?.label == "在学校", "School recognition")
         precondition(PlaceMatcher.match(point(accuracy: 500), places: [home], previous: nil, now: now) == nil,
@@ -39,11 +45,18 @@ enum PlaceContextChecks {
             "Invalid accuracy")
         precondition(PlaceMatcher.match(point(secondsAgo: 901), places: [home], previous: nil, now: now) == nil,
             "Expired location must not infer current place")
+        precondition(PlaceMatcher.match(point(secondsAgo: -60), places: [home], previous: nil, now: now) == nil,
+            "Future timestamps must not infer current place")
         let outside = point(latitude: 31.4, longitude: 121.7)
         precondition(PlaceMatcher.match(outside, places: [home, school], previous: nil, now: now)?.category == "unknown",
             "Outside known places is not automatically transit")
         let traveled = PlaceMatcher.match(outside, places: [home], previous: point(secondsAgo: 60), now: now)
         precondition(traveled?.category == "transit", "Observed displacement beyond accuracy can indicate transit")
+        precondition(PlaceMatcher.changesContext(previousCategory: "home", match: traveled), "Reliable travel changes the visual context")
+        precondition(!PlaceMatcher.changesContext(previousCategory: "home", match: coarse), "Same category is not a transition")
+        precondition(!PlaceMatcher.changesContext(previousCategory: "school", match: coarse), "Weak fixes cannot invalidate another context")
+        precondition(PlaceMatcher.changesContext(previousCategory: "home", match: schoolMatch), "Reliable category change invalidates old imagery")
+        precondition(PlaceMatcher.hasMoved(outside, from: point(secondsAgo: 60)), "Displacement test retains only a semantic transition time")
         let invalidPrevious = PlaceMatcher.match(outside, places: [], previous: point(accuracy: -1, secondsAgo: 60), now: now)
         precondition(invalidPrevious?.category == "unknown", "Invalid old location must not establish motion")
         let imprecisePrevious = PlaceMatcher.match(outside, places: [], previous: point(accuracy: 1_000, secondsAgo: 60), now: now)
@@ -57,6 +70,6 @@ enum PlaceContextChecks {
         precondition(!LocationFixQuality.isBetter(point(accuracy: 150), than: point(accuracy: 8)), "Do not regress to last coarse fix")
         let old = try! JSONDecoder().decode(UserPlace.self, from: Data(#"{"id":"old","name":"old","kind":"home","latitude":31.2,"longitude":121.4,"radius":300}"#.utf8))
         precondition(old.coordinateSystem == nil, "Legacy pins must remain distinguishable")
-        print("Place matcher checks passed: home/school categories, private-label isolation, stale/imprecise rejection, transit evidence and jitter.")
+        print("Place matcher checks passed: semantic precision, freshness, context transitions, private-label isolation, transit evidence and jitter.")
     }
 }

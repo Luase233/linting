@@ -11,10 +11,11 @@ struct RecommendationExplanationView: View {
     private var factors: [Factor] {
         guard let chosen else { return [] }
         let names = [("discovery", "探索与熟悉度先验"), ("favorite", "明确喜欢先验"), ("artist", "常听艺人先验"),
-            ("recency", "近期重复扣分"), ("variety", "风格重复扣分"), ("intent", "手动方向先验"),
+            ("recency", "近期重复扣分"), ("variety", "艺人重复扣分"), ("intent", "手动方向先验"),
             ("visual_intent", "听歌意图直接先验"), ("self_reported_mood", "自报感受直接先验"),
-            ("acceptance", "继续听收益 ×2.4"), ("rejection", "跳过／不适合扣分 ×−3"),
-            ("affinity", "明确偏好收益 ×2"), ("replay", "回听收益 ×1.5"),
+            ("acceptance", "旧版接受贡献"), ("rejection", "旧版拒绝贡献"),
+            ("affinity", "明确偏好贡献"), ("replay", "回听贡献"),
+            ("continuation", "持续收听贡献"), ("fit", "明确当下合适贡献"),
             ("baseline", "中性基线校正"), ("historical_remainder", "历史未细分项")]
         let values = RecommendationScoreDefinition.explanationFactors(score: chosen.score,
             predictions: chosen.predictions, storedFactors: chosen.scoreFactors)
@@ -34,7 +35,7 @@ struct RecommendationExplanationView: View {
         case "manual_previous": return "你返回了上一首"
         case "diagnostic": return "设备测试播放"
         case "manual_selection": return "你主动点播"
-        default: return chosen?.probability == nil ? "手动选择记录" : "算法抽样选曲"
+        default: return chosen?.probability == nil ? "手动选择记录" : "按当下依据选曲"
         }
     }
 
@@ -57,6 +58,9 @@ struct RecommendationExplanationView: View {
                 Text(track.artist).foregroundStyle(.secondary)
             }
             if let snapshot, let chosen {
+                evidenceSummary(chosen)
+                contextInfluences(snapshot)
+                DisclosureGroup("查看算法诊断：分数、倾向与抽样") {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading) {
                         Text(chosen.probability == nil ? "模型参考分" : "本轮排序总分").font(.caption).foregroundStyle(.secondary)
@@ -77,7 +81,7 @@ struct RecommendationExplanationView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 12) {
                     Text("排序分怎样算出来").font(.headline)
-                    Text("先验项 + 2.4×继续听 − 3×跳过／不适合 + 2×偏好 + 1.5×回听 − 1.45")
+                    Text("各项实际贡献相加得到排序分；负值减少优先级，正值提高优先级。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Chart(factors) { factor in
                         BarMark(xStart: .value("起点", min(0, factor.value)), xEnd: .value("分数", max(0, factor.value)), y: .value("因素", factor.title))
@@ -88,24 +92,27 @@ struct RecommendationExplanationView: View {
                     }.chartXAxisLabel("分值贡献（全部相加 = 总分）")
                         .frame(height: CGFloat(max(5, factors.count)) * 31 + 35)
                         .padding(.horizontal, 8)
-                    Text("跳过倾向越高，扣分越多；它始终以负号进入总分。固定 −1.45 让四项都为中性值 0.5 时模型合计为 0。总分不是百分制，也不适合跨轮比较。显示保留三位，合计用原始精度。")
+                    Text("总分不是百分制，也不适合跨轮比较。新目标独立学习，旧快照保留当时公式。显示保留三位，合计用原始精度。")
                         .font(.caption).foregroundStyle(.secondary)
                     Text(chosen.probability == nil
                         ? "这是点播时的模型参考值，不是选择这首的原因；点播没有候选排序先验，也没有抽样概率。"
-                        : "时间、健康、场景与歌曲特征通过四个模型输出参与排序；意图与感受先验只展示额外的直接调整，不代表它们的全部影响。")
+                        : "时间、健康、场景与歌曲特征参与模型；直接先验不是情境影响的全部。当前输出均未经独立概率校准。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 predictionRows(chosen)
                 if chosen.probability != nil {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("抽中概率是选曲规则，不是适合你的概率。").font(.caption.bold())
-                        if let temperature = snapshot.samplingTemperature, let exploration = snapshot.uniformExploration {
+                        if let budget = snapshot.explorationBudget {
+                            Text("本轮探索预算 " + String(format: "%.0f%%", budget * 100) + "；仅在质量门槛内、存在兴趣关联且证据不足的候选中探索。其余概率分配给优先候选。")
+                                .font(.caption2)
+                        } else if let temperature = snapshot.samplingTemperature, let exploration = snapshot.uniformExploration {
                             Text(String(format: "抽样概率 = %.0f%% × softmax(总分 ÷ %.2f) + %.0f%% ÷ 候选数", (1 - exploration) * 100, temperature, exploration * 100))
                                 .font(.caption2.monospacedDigit())
                         } else {
                             Text("历史快照未记录抽样参数，保留当时的原始概率。").font(.caption2)
                         }
-                        Text("本轮共 \(snapshot.candidates.count) 首候选，全部抽样概率合计为 100%。探索允许选中较低分歌曲；下方展示前八名和本次选中歌曲。探索偏好先验调整分数，均匀探索是之后的抽样步骤。")
+                        Text("本轮共 \(snapshot.candidates.count) 首候选，最终概率合计为 100%。未通过策略门槛的候选为 0；下方展示前八名和本次选中歌曲。旧版快照仍显示旧规则。")
                             .font(.caption)
                     }.foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 10) {
@@ -115,9 +122,9 @@ struct RecommendationExplanationView: View {
                             HStack {
                                 Text("\(row.rank)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(candidates.first { $0.id == item.trackID }?.title ?? (item.trackID == track.id ? track.title : "歌曲 \(item.trackID)"))
+                                    Text(item.title ?? candidates.first { $0.id == item.trackID }?.title ?? (item.trackID == track.id ? track.title : "歌曲 \(item.trackID)"))
                                         .font(.caption).lineLimit(1)
-                                    Text(item.sourceTag).font(.caption2).foregroundStyle(.secondary)
+                                    Text([item.artist, item.recallChannels?.joined(separator: " · ") ?? item.sourceTag].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if item.trackID == track.id { Image(systemName: "checkmark.circle.fill").foregroundStyle(.orange) }
@@ -127,8 +134,9 @@ struct RecommendationExplanationView: View {
                         }
                     }
                 }
+                }
             } else {
-                Text("这首歌还没有可用的决策快照；完成选曲后会显示真实分数。").foregroundStyle(.secondary)
+                Text("这首歌还没有可用的决策快照；完成选曲后会显示真实依据。").foregroundStyle(.secondary)
             }
             Divider()
             tempoSection
@@ -136,15 +144,76 @@ struct RecommendationExplanationView: View {
         }
     }
 
+    private func evidenceSummary(_ candidate: AdaptiveCandidateSnapshot) -> some View {
+        let evidence = candidate.effectiveEvidence ?? [:]
+        let count = evidence.values.reduce(0, +)
+        return VStack(alignment: .leading, spacing: 12) {
+            Label(selectionTitle, systemImage: "waveform.path").font(.headline)
+            Text(candidate.probability == nil ? "由你选择，继续记录真实反馈" :
+                candidate.selectionRole == "explore" ? "通过门槛，尝试了解的新候选" :
+                candidate.selectionRole == "main" ? "本轮优先候选" : "历史推荐记录")
+                .font(.title3.bold())
+            Text(count == 0 ? "这首歌的有效反馈仍不足，当前主要参考已有口味、歌曲资料和可用情境。" :
+                "这首歌有 \(count) 项有效目标记录；同一次播放可能支持多个目标，不能视为 \(count) 次独立验证。")
+                .font(.subheadline).foregroundStyle(.secondary)
+            if let channels = candidate.recallChannels, !channels.isEmpty {
+                Text("从这里找到它：" + channels.joined(separator: " · ")).font(.caption)
+            }
+            if (candidate.scoreFactors?["favorite"] ?? 0) > 0 {
+                Label("你明确喜欢过这首歌", systemImage: "heart").font(.caption)
+            }
+            if (candidate.scoreFactors?["artist"] ?? 0) > 0 {
+                Label("与你常听的艺人有关", systemImage: "person.wave.2").font(.caption)
+            }
+            Text("是否适合此刻，以你的反馈为准；目前不展示未经校准的“适合百分比”。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func contextInfluences(_ snapshot: AdaptiveDecisionSnapshot) -> some View {
+        if let influences = snapshot.contextInfluences, !influences.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("情境实际改变了什么").font(.headline)
+                ForEach(influences, id: \.source) { influence in
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text(["visual": "图片", "image": "图片", "place": "位置", "location": "位置", "health": "体征"][influence.source] ?? influence.source).font(.subheadline.bold())
+                            Spacer()
+                            Text(influence.coverage > 0 ? (influence.rankingChanged ? "改变排序" : "未改变排序") : "本轮缺少有效线索")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let effect = influence.candidateEffects.first(where: { $0.trackID == track.id }) {
+                            Text(String(format: "移除该类线索后对照：本曲贡献差 %+.3f；选择分布变化 %.1f%%。", effect.scoreDelta, influence.totalVariation * 100))
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        if !influence.missing.isEmpty {
+                            Text(influence.missing.joined(separator: "；")).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Text("这是同一轮候选的移除对照，只说明线索怎样影响决策；不能证明体验改善或因果关系。图片曾引用地点时，两者相关，影响不能相加。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func predictionLabels(_ candidate: AdaptiveCandidateSnapshot) -> [(String, String, String)] {
+        if candidate.predictions["continuation"] != nil {
+            return [("continuation", "持续收听", "可观察结果"), ("fit", "当下合适", "明确反馈"),
+                    ("affinity", "长期偏好", "明确喜欢"), ("replay", "主动回听", "实际重听")]
+        }
+        return [("acceptance", "旧版接受", "软目标"), ("rejection", "旧版拒绝", "软目标"),
+                ("affinity", "明确偏好", "高更有利"), ("replay", "主动回听", "高更有利")]
+    }
+
     private func predictionRows(_ candidate: AdaptiveCandidateSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("四个独立的倾向指数").font(.headline)
+            Text("模型倾向诊断").font(.headline)
             Text("范围 0–100，来自多种反馈的软目标学习；不是校准后的发生概率，也不要求相加为 100。未学习的中性初值不代表有一半把握。")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("2.4、3、2、1.5 是人为设定的排序权重。继续听和跳过会从同一次切歌更新，因此相关；同时计分体现设定的优先级，不是两份独立证据。喜欢／艺人先验保留明确选择，偏好模型学习泛化，两者可能同时加分。")
+            Text("持续收听只描述可观察的播放结果；当下合适来自明确反馈；喜欢描述长期口味。它们不是彼此独立的统计证据，排序系数仍是待验证的工程参数。旧版接受／拒绝软目标仅供历史诊断。")
                 .font(.caption).foregroundStyle(.secondary)
-            ForEach([("acceptance", "继续听", "高更有利"), ("rejection", "跳过／不适合", "低更有利"),
-                     ("affinity", "明确偏好", "高更有利"), ("replay", "主动回听", "高更有利")], id: \.0) { key, title, direction in
+            ForEach(predictionLabels(candidate), id: \.0) { key, title, direction in
                 if let value = candidate.predictions[key], value.isFinite {
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
@@ -155,7 +224,7 @@ struct RecommendationExplanationView: View {
                         }
                         ProgressView(value: min(1, max(0, value))).tint(key == "rejection" ? .red : .orange)
                         if let count = candidate.predictionUpdates?[key] {
-                            Text(count == 0 ? "当时尚无这类学习记录，使用中性初值。" : "决策时已有 \(count) 次该项学习更新。")
+                            Text(count == 0 ? "当时尚无这类学习记录，使用中性初值。" : "模型全局更新 \(count) 次；不代表这首歌有同等证据量。")
                                 .font(.caption2).foregroundStyle(.secondary)
                         } else { Text("旧快照未记录该项学习次数。").font(.caption2).foregroundStyle(.secondary) }
                     }

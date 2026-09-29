@@ -23,6 +23,14 @@ struct PlaybackEvidence: Codable {
     let endReason: String
     let actions: [PlaybackAction]
     let contentKind: String
+    var labelVersion: String? = nil
+    var continuationTarget: Double? = nil
+    var continuationCensorReason: String? = nil
+
+    var isDiagnostic: Bool {
+        let reason = startReason.lowercased()
+        return reason.contains("diagnostic") || reason.contains("smoke") || reason == "system"
+    }
 }
 
 /// Accumulates actual forward playback, not playhead position. No claim of human attention.

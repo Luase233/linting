@@ -29,28 +29,44 @@ struct PlaceMatch {
 
 enum PlaceMatcher {
     static func match(_ location: CLLocation, places: [UserPlace], previous: CLLocation?, now: Date = Date()) -> PlaceMatch? {
-        guard location.horizontalAccuracy >= 0, location.horizontalAccuracy <= 250,
-              abs(now.timeIntervalSince(location.timestamp)) <= 900 else { return nil }
+        guard CLLocationCoordinate2DIsValid(location.coordinate), location.horizontalAccuracy.isFinite,
+              location.horizontalAccuracy >= 0, location.horizontalAccuracy <= 250,
+              (-5...900).contains(now.timeIntervalSince(location.timestamp)) else { return nil }
+        // Absolute accuracy matters even inside a very large saved circle. A 250 m fix is
+        // weak evidence regardless of the radius the user chose. This is a bounded quality
+        // heuristic, not a calibrated probability of being at a named place.
+        let precision = max(0, 1 - location.horizontalAccuracy / 300)
         let ranked = places.map { place in
             (place, location.distance(from: CLLocation(latitude: place.latitude, longitude: place.longitude)))
         }.sorted { $0.1 < $1.1 }
         if let (place, _) = ranked.first(where: { $0.1 + location.horizontalAccuracy <= $0.0.radius }) {
-            let confidence = max(0.4, min(1, 1 - location.horizontalAccuracy / max(100, place.radius)))
+            let confidence = precision * min(1, max(0, 1 - location.horizontalAccuracy / max(100, place.radius)))
             return PlaceMatch(label: place.kind == .other ? "在自定义地点" : "在" + place.kind.title,
                               category: place.kind.rawValue, confidence: confidence)
         }
         // Outside a saved circle is not evidence of travel. Require observed motion.
         if location.speed >= 1.2, location.speedAccuracy >= 0, location.speedAccuracy <= 2 {
-            return PlaceMatch(label: "在移动中", category: "transit", confidence: 0.7)
+            return PlaceMatch(label: "在移动中", category: "transit", confidence: 0.7 * precision)
         }
-        if let previous, previous.horizontalAccuracy >= 0, previous.horizontalAccuracy <= 250 {
-            let seconds = location.timestamp.timeIntervalSince(previous.timestamp)
-            let uncertainty = max(0, previous.horizontalAccuracy) + location.horizontalAccuracy
-            if (30...900).contains(seconds), location.distance(from: previous) - uncertainty > 200 {
-                return PlaceMatch(label: "近期位置发生移动", category: "transit", confidence: 0.5)
-            }
+        if hasMoved(location, from: previous) {
+            return PlaceMatch(label: "近期位置发生移动", category: "transit", confidence: 0.6 * precision)
         }
         return PlaceMatch(label: "未匹配已添加地点", category: "unknown", confidence: 0)
+    }
+
+    static func hasMoved(_ location: CLLocation, from previous: CLLocation?) -> Bool {
+        guard let previous, CLLocationCoordinate2DIsValid(previous.coordinate),
+              previous.horizontalAccuracy.isFinite, (0...250).contains(previous.horizontalAccuracy),
+              location.horizontalAccuracy.isFinite, (0...250).contains(location.horizontalAccuracy) else { return false }
+        let seconds = location.timestamp.timeIntervalSince(previous.timestamp)
+        let uncertainty = previous.horizontalAccuracy + location.horizontalAccuracy
+        return (30...900).contains(seconds) && location.distance(from: previous) - uncertainty > 200
+    }
+
+    static func changesContext(previousCategory: String?, match: PlaceMatch?) -> Bool {
+        guard let previousCategory, previousCategory != "unknown", let match,
+              match.category != "unknown", match.confidence >= 0.4 else { return false }
+        return previousCategory != match.category
     }
 }
 
@@ -77,6 +93,7 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
             if !enabled {
                 cancelUpdate(); pendingAuthorization = false
                 semanticLabel = nil; semanticCategory = nil; observedAt = nil; semanticConfidence = 0
+                semanticChangedAt = nil; lastReliableCategory = nil
                 currentLocation = nil; previousLocation = nil; lastCoordinate = nil; horizontalAccuracy = nil
                 status = "位置辅助已关闭"
                 NotificationCenter.default.post(name: .init("LintingLocationContextChanged"), object: self)
@@ -90,6 +107,7 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
     @Published private(set) var semanticCategory: String?
     @Published private(set) var semanticConfidence: Double = 0
     @Published private(set) var observedAt: Date?
+    @Published private(set) var semanticChangedAt: Date?
     @Published private(set) var status = "按需读取位置，用你添加的地点判断在家、学校或路上。"
     @Published private(set) var requesting = false
     @Published private(set) var lastCoordinate: CLLocationCoordinate2D?
@@ -102,6 +120,7 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
     private let manager = CLLocationManager()
     private var currentLocation: CLLocation?
     private var previousLocation: CLLocation?
+    private var lastReliableCategory: String?
     private var timeoutTask: Task<Void, Never>?
     private var pendingAuthorization = false
     private var acquisitionStartedAt: Date?
@@ -121,7 +140,9 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
     }
 
     var freshCategory: String? {
-        guard enabled, let observedAt, Date().timeIntervalSince(observedAt) < 900 else { return nil }
+        let lifetime: TimeInterval = semanticCategory == "transit" ? 300 : 900
+        guard enabled, let observedAt, (-5..<lifetime).contains(Date().timeIntervalSince(observedAt)),
+              semanticConfidence.isFinite, semanticConfidence > 0, semanticCategory != "unknown" else { return nil }
         return semanticCategory
     }
 
@@ -227,6 +248,11 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
             return corrected
         }
         if let match = PlaceMatcher.match(location, places: geographicPlaces, previous: previousLocation) {
+            if PlaceMatcher.changesContext(previousCategory: lastReliableCategory, match: match) ||
+               (match.confidence >= 0.4 && PlaceMatcher.hasMoved(location, from: previousLocation)) {
+                semanticChangedAt = location.timestamp
+            }
+            if match.confidence >= 0.4 { lastReliableCategory = match.category }
             semanticLabel = match.label; semanticCategory = match.category; semanticConfidence = match.confidence
             status = match.label + " · 估计误差 ±\(Int(ceil(location.horizontalAccuracy))) 米 · " + location.timestamp.formatted(date: .omitted, time: .shortened)
         } else {
@@ -246,6 +272,7 @@ final class LocationContextManager: NSObject, ObservableObject, CLLocationManage
             }
             if [.denied, .restricted].contains(self.manager.authorizationStatus) {
                 self.semanticLabel = nil; self.semanticCategory = nil; self.observedAt = nil; self.semanticConfidence = 0
+                self.semanticChangedAt = nil; self.lastReliableCategory = nil
                 self.cancelUpdate(); self.lastCoordinate = nil; self.horizontalAccuracy = nil
                 self.currentLocation = nil; self.previousLocation = nil
                 self.status = "定位未允许，地点线索未启用。"

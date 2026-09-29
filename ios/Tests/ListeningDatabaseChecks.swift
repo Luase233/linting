@@ -58,7 +58,9 @@ import CryptoKit
         a.acceptance.weights == b.acceptance.weights && a.acceptance.updates == b.acceptance.updates &&
         a.rejection.weights == b.rejection.weights && a.rejection.updates == b.rejection.updates &&
         a.affinity.weights == b.affinity.weights && a.affinity.updates == b.affinity.updates &&
-        a.replay.weights == b.replay.weights && a.replay.updates == b.replay.updates
+        a.replay.weights == b.replay.weights && a.replay.updates == b.replay.updates &&
+        a.continuation.weights == b.continuation.weights && a.continuation.updates == b.continuation.updates &&
+        a.fit.weights == b.fit.weights && a.fit.updates == b.fit.updates && a.labelVersion == b.labelVersion
     }
 
     @MainActor static func main() async throws {

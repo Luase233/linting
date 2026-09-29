@@ -16,6 +16,26 @@ private final class NetEaseRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/// Session metadata cache only: no account cookies, playback URLs or listening labels.
+private actor NetEaseTrackMetadataCache {
+    static let shared = NetEaseTrackMetadataCache()
+    private var rows: [String: (RecommendedTrack, Date)] = [:]
+    func cached(ids: [String], now: Date = Date()) -> [String: RecommendedTrack] {
+        var result: [String: RecommendedTrack] = [:]
+        for id in ids {
+            if let row = rows[id], now.timeIntervalSince(row.1) < 24 * 3600 { result[id] = row.0 }
+        }
+        return result
+    }
+    func insert(_ tracks: [RecommendedTrack], now: Date = Date()) {
+        for track in tracks where !track.title.isEmpty && !track.artist.isEmpty { rows[track.id] = (track, now) }
+        if rows.count > 2000 {
+            let old = rows.sorted { $0.value.1 < $1.value.1 }.prefix(rows.count - 2000).map(\.key)
+            for id in old { rows.removeValue(forKey: id) }
+        }
+    }
+}
+
 // Ordinary endpoints, following api-enhanced's request format. No unlock routes.
 struct NetEaseDirectClient {
     enum Crypto { case eapi, weapi }
@@ -34,7 +54,9 @@ struct NetEaseDirectClient {
             "s": query, "type": 1, "limit": limit, "offset": offset, "total": true
         ])
         let result = response.body["result"] as? [String: Any]
-        return (result?["songs"] as? [[String: Any]] ?? []).compactMap(Self.track)
+        let tracks = (result?["songs"] as? [[String: Any]] ?? []).compactMap(Self.track)
+        await NetEaseTrackMetadataCache.shared.insert(tracks)
+        return tracks
     }
 
     func playlists(userID: String, offset: Int = 0) async throws -> (items: [MusicPlaylist], more: Bool, nextOffset: Int) {
@@ -64,9 +86,15 @@ struct NetEaseDirectClient {
 
     func songDetails(ids: [String]) async throws -> [RecommendedTrack] {
         guard !ids.isEmpty, ids.count <= 100, ids.allSatisfy(Self.validID) else { throw NetEaseDirectError.invalidResponse }
-        let reply = try await request(path: "/api/v3/song/detail", values: ["c": try Self.json(ids.map { ["id": $0] })], crypto: .weapi)
-        guard let songs = reply.body["songs"] as? [[String: Any]] else { throw NetEaseDirectError.invalidResponse }
-        let byID = Dictionary(songs.compactMap(Self.track).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var byID = await NetEaseTrackMetadataCache.shared.cached(ids: ids)
+        let missing = ids.filter { byID[$0] == nil }
+        if !missing.isEmpty {
+            let reply = try await request(path: "/api/v3/song/detail", values: ["c": try Self.json(missing.map { ["id": $0] })], crypto: .weapi)
+            guard let songs = reply.body["songs"] as? [[String: Any]] else { throw NetEaseDirectError.invalidResponse }
+            let tracks = songs.compactMap(Self.track)
+            await NetEaseTrackMetadataCache.shared.insert(tracks)
+            for track in tracks { byID[track.id] = track }
+        }
         return ids.compactMap { byID[$0] }
     }
 

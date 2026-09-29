@@ -11,6 +11,8 @@ enum DeviceSmokeChecks {
         guard !hasRun, ProcessInfo.processInfo.environment["LINTING_DEVICE_CHECK"] == "1" else { return }
         hasRun = true
         var report: [String: String] = ["started_at": ISO8601DateFormatter().string(from: Date()), "status": "running"]
+        report["app_version"] = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        report["app_build"] = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
         func save() {
             do {
                 let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -107,6 +109,23 @@ enum DeviceSmokeChecks {
                 report["second_playing"] = String(secondPlaying)
                 report["skip_to_playing_ms"] = String(Int((ProcessInfo.processInfo.systemUptime - switchStart) * 1000))
                 report["second_track_id"] = model.currentTrack?.id ?? "none"
+                if let decision = model.decisionSnapshot,
+                   let selected = decision.candidate(decision.chosenTrackID) {
+                    let total = decision.candidates.reduce(0) { $0 + ($1.probability ?? 0) }
+                    let ranked = decision.candidates.sorted { $0.score == $1.score ? $0.trackID < $1.trackID : $0.score > $1.score }
+                    report["recommendation_policy"] = decision.policyVersion
+                    report["candidate_count"] = String(decision.candidates.count)
+                    report["chosen_rank"] = ranked.firstIndex(where: { $0.trackID == selected.trackID }).map { String($0 + 1) }
+                    report["chosen_role"] = selected.selectionRole ?? "legacy"
+                    report["chosen_probability"] = selected.probability.map(String.init(describing:))
+                    report["exploration_budget"] = decision.explorationBudget.map(String.init(describing:))
+                    report["distribution_sum_valid"] = String(abs(total - 1) < 1e-9)
+                    report["chosen_probability_positive"] = String((selected.probability ?? 0) > 0)
+                    report["excluded_probability_zero"] = String(decision.candidates.filter { $0.selectionRole == "excluded" }.allSatisfy { ($0.probability ?? 0) == 0 })
+                    report["candidate_metadata_complete"] = String(decision.candidates.allSatisfy { !($0.title?.isEmpty ?? true) && !($0.artist?.isEmpty ?? true) })
+                    report["context_counterfactuals"] = String(decision.contextInfluences?.count ?? 0)
+                    report["new_observable_target"] = String(selected.predictions["continuation"] != nil && selected.predictions["fit"] != nil)
+                } else { report["recommendation_snapshot"] = "missing" }
                 save()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }

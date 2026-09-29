@@ -264,14 +264,18 @@ struct ContentView: View {
         HStack(spacing: 6) {
             Button {
                 ListeningHaptics.select()
-                Task { await model.replay() }
-            } label: { Label("再听一次", systemImage: "arrow.counterclockwise").frame(minHeight: 44) }
+                model.feedback("suitable")
+            } label: { Label("此刻合适", systemImage: "checkmark.circle").frame(minHeight: 44) }
             Spacer(minLength: 4)
             Button {
                 ListeningHaptics.select()
                 model.feedback("unsuitable")
             } label: { Label("此刻不合适", systemImage: "arrow.right").frame(minHeight: 44) }
             Menu {
+                Button("再听一次", systemImage: "arrow.counterclockwise") {
+                    ListeningHaptics.select()
+                    Task { await model.replay() }
+                }
                 Button("不喜欢这首", systemImage: "hand.thumbsdown") {
                     ListeningHaptics.select()
                     model.feedback("disliked")
